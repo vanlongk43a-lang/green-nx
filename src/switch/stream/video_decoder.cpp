@@ -71,15 +71,10 @@ void VideoDecoder::shutdown() {
     if (texture_) SDL_DestroyTexture(texture_), texture_ = nullptr;
 }
 
-bool VideoDecoder::ensure_texture(SDL_Renderer* renderer, int width,
-                                  int height) {
-    if (texture_ && width == width_ && height == height_) return true;
-    if (texture_) SDL_DestroyTexture(texture_);
-    texture_ = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV,
-                                 SDL_TEXTUREACCESS_STREAMING, width, height);
-    width_ = width;
-    height_ = height;
-    return texture_ != nullptr;
+bool VideoDecoder::decode(const uint8_t* data, size_t size) {
+    (void)data;
+    (void)size;
+    return true;
 }
 
 bool VideoDecoder::decode(const uint8_t* data, size_t size) {
