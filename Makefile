@@ -10,7 +10,7 @@ endif
 
 include $(DEVKITPRO)/libnx/switch_rules
 
-APP_TITLE   := green-nx
+APP_TITLE   := Control XB
 APP_AUTHOR  := rmrf404
 APP_VERSION := 1.0.25
 APP_ICON    := icon.jpg
