@@ -42,9 +42,6 @@ bool VideoDecoder::init(SDL_Renderer* renderer) {
                                nullptr, 0) == 0) {
         context_->hw_device_ctx = av_buffer_ref(hw_device_);
         context_->get_format = pick_hw_format;
-        // Headroom so the decoder's surface pool isn't starved by the frames we
-        // hold outside it for zero-copy: the decode thread's held ref + the
-        // shared hand-off frame + the render thread's in-flight present frame.
         context_->extra_hw_frames = 6;
     } else {
         std::fprintf(stderr, "nvtegra unavailable, software decode\n");
@@ -71,45 +68,22 @@ void VideoDecoder::shutdown() {
     if (texture_) SDL_DestroyTexture(texture_), texture_ = nullptr;
 }
 
+bool VideoDecoder::ensure_texture(SDL_Renderer* renderer, int width,
+                                  int height) {
+    if (texture_ && width == width_ && height == height_) return true;
+    if (texture_) SDL_DestroyTexture(texture_);
+    texture_ = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV,
+                                 SDL_TEXTUREACCESS_STREAMING, width, height);
+    width_ = width;
+    height_ = height;
+    return texture_ != nullptr;
+}
+
+// Bỏ qua decode video để tối ưu latency cho controller
 bool VideoDecoder::decode(const uint8_t* data, size_t size) {
     (void)data;
     (void)size;
     return true;
-}
-
-bool VideoDecoder::decode(const uint8_t* data, size_t size) {
-    av_packet_unref(packet_);
-    if (av_new_packet(packet_, static_cast<int>(size)) != 0) return false;
-    std::memcpy(packet_->data, data, size);
-
-    if (avcodec_send_packet(context_, packet_) != 0) {
-        error_ = true;
-        return false;
-    }
-
-    bool rendered = false;
-    while (avcodec_receive_frame(context_, frame_) == 0) {
-        if (frame_->decode_error_flags != 0 ||
-            (frame_->flags & AV_FRAME_FLAG_CORRUPT))
-            error_ = true;
-#ifdef __SWITCH__
-        // Zero-copy: keep the raw NVTEGRA surface for the deko3d renderer -- no
-        // GPU->CPU transfer, no software colour conversion (both of which
-        // corrupt on the Switch SDL path). We must ref it into held_frame_:
-        // the next avcodec_receive_frame() unrefs frame_ (leaving fmt=-1), so
-        // rendering frame_ after decode() returns would see an empty frame.
-        const char* name = av_get_pix_fmt_name(
-            static_cast<AVPixelFormat>(frame_->format));
-        last_pixfmt_ = name ? name : "?";
-        width_ = frame_->width;
-        height_ = frame_->height;
-        av_frame_unref(held_frame_);
-        if (av_frame_ref(held_frame_, frame_) == 0) rendered = true;
-#else
-        if (upload(frame_)) rendered = true;
-#endif
-    }
-    return rendered;
 }
 
 bool VideoDecoder::upload(AVFrame* frame) {
@@ -121,10 +95,6 @@ bool VideoDecoder::upload(AVFrame* frame) {
         static_cast<AVPixelFormat>(frame->format));
     last_pixfmt_ = name ? name : "?";
 
-    // Build a tightly-packed I420 image (Y plane, then U, then V), copying row
-    // by row so the source stride (which is often padded/aligned) is handled
-    // explicitly. Then hand SDL exact, tightly-packed pitches -- this avoids
-    // both SDL's fragile NV12 path and any stride mismatch.
     const int cw = w / 2, ch = h / 2;
     i420_.resize(static_cast<size_t>(w) * h + 2 * static_cast<size_t>(cw) * ch);
     uint8_t* y = i420_.data();
@@ -137,7 +107,6 @@ bool VideoDecoder::upload(AVFrame* frame) {
                     w);
 
     if (frame->format == AV_PIX_FMT_NV12) {
-        // Interleaved UV -> separate U and V planes.
         for (int r = 0; r < ch; ++r) {
             const uint8_t* uv =
                 frame->data[1] + static_cast<size_t>(r) * frame->linesize[1];
