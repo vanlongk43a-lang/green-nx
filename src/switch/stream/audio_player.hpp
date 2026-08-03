@@ -1,26 +1,36 @@
-#include "audio_player.hpp"
+#pragma once
+
+#include <switch.h>
+
+#include <atomic>
+#include <cstdint>
 
 namespace gnx::stream {
 
-// Khởi tạo Audio Player giả lập: Trả về true ngay để app tiếp tục chạy
-bool AudioPlayer::init() {
-    return true;
-}
+class AudioPlayer {
+public:
+    bool init();
+    void shutdown();
 
-// Tắt Audio Player: Không mở luồng phát nhạc nên không cần dọn dẹp
-void AudioPlayer::shutdown() {
-}
+    void submit(uint16_t seq, const uint8_t* data, size_t size);
 
-// Bỏ qua hoàn toàn các gói tin âm thanh truyền về từ Xbox
-void AudioPlayer::submit(uint16_t seq, const uint8_t* data, size_t size) {
-    (void)seq;
-    (void)data;
-    (void)size;
-}
+    int device_hz() const { return 48000; }
+    void set_gain(float gain) { (void)gain; }
 
-// Báo cáo thống kê rỗng để tránh lỗi gọi hàm telemetry
-AudioPlayer::Stats AudioPlayer::stats() const {
-    return Stats{};
-}
+    struct Stats {
+        uint32_t received = 0;
+        uint32_t played = 0;
+        uint32_t failed = 0;
+        uint32_t lost = 0;
+        uint32_t underruns = 0;
+        uint32_t dropped_ms = 0;
+        uint32_t queue_ms = 0;
+        uint32_t frames = 0;
+        uint32_t out_samples = 0;
+        uint32_t ema_ms = 0;
+        int32_t adj_ppm = 0;
+    };
+    Stats stats() const;
+};
 
 }  // namespace gnx::stream
