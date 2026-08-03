@@ -15,7 +15,7 @@ APP_AUTHOR  := rmrf404
 APP_VERSION := 1.0.25
 APP_ICON    := icon.jpg
 
-TARGET   := green-nx
+TARGET   := XboxController
 BUILD    := build-switch
 SOURCES  := src/core src/switch
 INCLUDES := src vendor deps/shim/include
