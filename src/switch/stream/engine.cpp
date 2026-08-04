@@ -1,1449 +1,210 @@
 #include "engine.hpp"
-
-#include <algorithm>
-#include <cctype>
+#include <switch.h>
 #include <chrono>
-#include <cstdarg>
-#include <sstream>
-#include <cstring>
+#include <thread>
+#include <iostream>
 
-extern "C" {
-#include <peer.h>
-#include <libavutil/frame.h>
-#include <libavutil/log.h>
+// LƯU Ý: Đã tắt kết nối tới dk_video_renderer.hpp và audio_player.hpp
+// để phục vụ chế độ Controller-Only (tiết kiệm pin & tối ưu latency).
+
+Engine::Engine() 
+    : m_running(false)
+    , m_connected(false)
+    , m_peer_connection(nullptr)
+    , m_input_channel(nullptr)
+    , m_control_channel(nullptr) {
+    
+    // Khởi tạo hệ thống Pad (Input) của libnx
+    padConfigureInput(1, HIDNPAD_MODE_HANDHELD_CONS);
+    padInitializeDefault(&m_pad_state);
 }
 
-extern "C" void gnx_peer_log_set(void (*cb)(const char* line));
-
-#ifndef GNX_VERSION
-#define GNX_VERSION "dev"
-#endif
-
-namespace {
-// libpeer's LOG_REDIRECT sink funnels through this single active engine.
-gnx::stream::Engine* g_log_engine = nullptr;
-
-// Route ffmpeg's own diagnostics (H.264 reference errors, concealment, ...)
-// into stream-log; without this the decoder's complaints are invisible.
-void av_log_capture(void* avcl, int level, const char* fmt, va_list vl) {
-    (void)avcl;
-    if (level > AV_LOG_WARNING) return;
-    static std::atomic<int> lines{0};
-    if (lines.fetch_add(1) >= 300) return;  // never flood the SD card
-    char buf[256];
-    vsnprintf(buf, sizeof(buf), fmt, vl);
-    size_t n = std::strlen(buf);
-    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
-    if (n && g_log_engine)
-        g_log_engine->log(std::string("ffmpeg| ") + buf);
-}
-
-void install_av_log_capture() { av_log_set_callback(&av_log_capture); }
-
-// libsrtp + usrsctp are process-wide: initialized with the first Engine and
-// released once, by Engine::global_shutdown, on the way out of the app.
-bool g_peer_initialized = false;
-}
-
-namespace gnx::stream {
-
-namespace {
-// Safety cap only: each queue entry is one H.264 NALU, and pump_video drains
-// the whole queue every render frame, so this is normally near-empty. Dropping
-// individual NALUs corrupts the stream, so on overflow we clear and recover
-// with a keyframe instead.
-constexpr size_t kMaxQueuedVideo = 64;
-
-struct TierProfile {
-    int width, height, bitrate_kbps, fps;
-};
-
-TierProfile tier_profile(QualityTier tier) {
-    switch (tier) {
-        case QualityTier::P720: return {1280, 720, 10000, 60};
-        case QualityTier::P1080: return {1920, 1080, 20000, 60};
-        case QualityTier::P1080HQ: return {1920, 1080, 30000, 60};
-    }
-    return {1920, 1080, 20000, 60};
-}
-
-// Extract "candidate:..." lines from a local SDP for the /ice POST.
-std::vector<std::string> local_candidates_from_sdp(const std::string& sdp) {
-    std::vector<std::string> out;
-    size_t at = 0;
-    while ((at = sdp.find("a=candidate:", at)) != std::string::npos) {
-        size_t end = sdp.find_first_of("\r\n", at);
-        out.push_back(sdp.substr(at + 2, end - at - 2));
-        at = end == std::string::npos ? sdp.size() : end;
-    }
-    return out;
-}
-
-std::string ufrag_from_sdp(const std::string& sdp) {
-    size_t at = sdp.find("a=ice-ufrag:");
-    if (at == std::string::npos) return "";
-    at += std::strlen("a=ice-ufrag:");
-    size_t end = sdp.find_first_of("\r\n", at);
-    return sdp.substr(at, end - at);
-}
-
-}  // namespace
-
-Engine::Engine(XboxAuth& auth, SDL_Renderer* renderer)
-    : auth_(auth), renderer_(renderer) {
-    http_.set_abort_flag(&quit_);  // don't block shutdown on an HTTP call
-    // One-time global init of libsrtp + usrsctp. Without this, srtp_create()
-    // fails (no inbound SRTP -> no decryptable video) and usrsctp never
-    // associates (data channels never open). Idempotent guard: Engine is a
-    // singleton, but be safe.
-    if (!g_peer_initialized) {
-        peer_init();
-        g_peer_initialized = true;
-    }
-}
-
-// usrsctp's two service threads ("SCTP timer", "SCTP iterator") run until
-// usrsctp_finish(). Nothing used to call it, so they were still running when
-// main() returned -- and the moment hbloader unmapped the NRO underneath
-// them, they faulted on their next instruction (Instruction Abort, crash
-// report with the NRO already gone from the module list). Call this once,
-// after the last Engine is destroyed and before the app exits.
-void Engine::global_shutdown() {
-    if (!g_peer_initialized) return;
-    g_peer_initialized = false;
-    peer_deinit();
-}
-
-Engine::~Engine() { stop(); }
-
-void Engine::log(const std::string& line) {
-    std::lock_guard<std::mutex> lock(log_mutex_);
-    if (!log_file_) return;
-    std::fprintf(log_file_, "[%8llu] %s\n",
-                 static_cast<unsigned long long>(SDL_GetTicks64()),
-                 line.c_str());
-}
-
-void Engine::start(const std::string& title_id, QualityTier tier,
-                   const std::string& locale) {
-    home_server_id_.clear();
-    start_common(title_id, tier, locale);
-}
-
-void Engine::start_home(const std::string& server_id, QualityTier tier,
-                        const std::string& locale) {
-    home_server_id_ = server_id;
-    start_common("(your console)", tier, locale);
-}
-
-void Engine::start_common(const std::string& title_id, QualityTier tier,
-                          const std::string& locale) {
+Engine::~Engine() {
     stop();
-    title_id_ = title_id;
-    tier_ = tier;
-    locale_ = locale;
-    {
-        std::lock_guard<std::mutex> lock(log_mutex_);
-        if (log_file_) std::fclose(log_file_);
-#ifdef __SWITCH__
-        // Keep the previous session's log: rotate instead of overwrite.
-        std::remove("sdmc:/switch/green-nx/stream-log-prev.txt");
-        std::rename("sdmc:/switch/green-nx/stream-log.txt",
-                    "sdmc:/switch/green-nx/stream-log-prev.txt");
-        log_file_ = std::fopen("sdmc:/switch/green-nx/stream-log.txt", "w");
-        // Logging is diagnostic and must not stall the sole RTP socket pump.
-        // A synchronous fflush for the once-per-second audio line was enough
-        // to produce a small regular video hitch on SD cards. Keep the session
-        // in memory and let fclose() flush it on clean stream shutdown (fail()
-        // flushes once so an error report still reaches the card).
-        if (log_file_) std::setvbuf(log_file_, nullptr, _IOFBF, 256 * 1024);
-#else
-        log_file_ = stderr;
-#endif
-    }
-    g_log_engine = this;
-    gnx_peer_log_set([](const char* line) {
-        if (g_log_engine) g_log_engine->log(std::string("  peer| ") + line);
-    });
-    const char* tier_name = tier == QualityTier::P720      ? "720p/android"
-                            : tier == QualityTier::P1080   ? "1080p/windows"
-                                                           : "1080pHQ/tizen";
-    log("green-nx v" GNX_VERSION " | stream start: " + title_id + " | tier " +
-        tier_name +
-        (pacing_ == VideoPacing::Smooth ? " | pacing smooth" : ""));
-    quit_ = false;
-    got_frame_ = false;
-    channels_open_ = false;
-    handshake_done_ = false;
-    server_ended_ = false;
-    last_media_ticks_ = 0;
-    peer_state_ = PEER_CONNECTION_NEW;  // previous session left it CLOSED
-    pli_sent_ = 0;
-    // Cumulative, and the HUD's bitrate window starts from zero in run_peer:
-    // carrying the previous stream's total over shows one absurd first sample.
-    video_bytes_ = 0;
-    install_av_log_capture();
-    jitter_.reset();
-    next_present_counter_ = 0;  // first frame presents immediately, then paced
-    state_ = EngineState::StartingSession;
-    video_.init(renderer_);
-    audio_.init();
-    audio_.set_gain(audio_gain_);
-#ifdef __SWITCH__
-    shared_frame_ = av_frame_alloc();
-    present_frame_ = av_frame_alloc();
-    shared_frame_valid_ = false;
-    shared_frame_seq_ = 0;
-    last_present_seq_ = 0;
-    present_hold_refreshes_ = 0;
-    smooth_have_present_ = false;
-    smooth_refresh_phase_ = 0;
-    source_refresh_period_ = 1;
-    source_fast_streak_ = source_slow_streak_ = 0;
-    last_decode_ticks_ = 0;
-    pace_new_ = pace_repeat_ = 0;
-    pace_hold1_ = pace_hold2_ = pace_hold3_ = pace_hold4p_ = 0;
-    pace_skip_ = 0;
-#endif
-    stream_epoch_ = SDL_GetTicks64();
-    thread_ = std::thread(&Engine::worker, this);
-#ifdef __SWITCH__
-    // Decode runs on its own thread so hardware-decode latency never delays
-    // input polling or the vsync-paced present on the main thread.
-    decode_thread_ = std::thread(&Engine::decode_loop, this);
-#endif
 }
 
-void Engine::stop() {
-    quit_ = true;
-    video_cv_.notify_all();  // wake the decode thread so it can see quit_
-    if (thread_.joinable()) thread_.join();
-    if (decode_thread_.joinable()) decode_thread_.join();
-    if (g_log_engine == this) {
-        gnx_peer_log_set(nullptr);
-        g_log_engine = nullptr;
-    }
-    {
-        std::lock_guard<std::mutex> lock(log_mutex_);
-        if (log_file_ && log_file_ != stderr) std::fclose(log_file_);
-        log_file_ = nullptr;
-    }
-    {
-        std::lock_guard<std::mutex> lock(peer_mutex_);
-        if (peer_) {
-            peer_connection_close(peer_);
-            peer_connection_destroy(peer_);
-            peer_ = nullptr;
-        }
-    }
-    video_.shutdown();
-    audio_.shutdown();
-    {
-        std::lock_guard<std::mutex> lock(video_mutex_);
-        video_queue_.clear();
-    }
-#ifdef __SWITCH__
-    {
-        // Decode thread is joined; safe to release the hand-off frames (unrefs
-        // any held NVTEGRA surface back to the decoder's pool).
-        std::lock_guard<std::mutex> lock(frame_mutex_);
-        if (shared_frame_) av_frame_free(&shared_frame_);
-        if (present_frame_) av_frame_free(&present_frame_);
-        for (SmoothFrame& queued : smooth_frames_)
-            if (queued.frame) av_frame_free(&queued.frame);
-        smooth_frames_.clear();
-        shared_frame_valid_ = false;
-    }
-#endif
-    if (state_ != EngineState::Failed) state_ = EngineState::Stopped;
-}
-
-std::string Engine::status() const {
-    std::lock_guard<std::mutex> lock(status_mutex_);
-    return status_;
-}
-
-std::string Engine::error() const {
-    std::lock_guard<std::mutex> lock(status_mutex_);
-    return error_;
-}
-
-void Engine::set_status(const std::string& status) {
-    std::lock_guard<std::mutex> lock(status_mutex_);
-    status_ = status;
-}
-
-// Orderly end of a session that the server closed on us. Not a failure: the
-// UI treats Stopped as "go back to the library", so the user lands in the menu
-// the way they would after ending the stream themselves.
-void Engine::end_session() {
-    {
-        std::lock_guard<std::mutex> lock(log_mutex_);
-        if (log_file_) std::fflush(log_file_);
-    }
-    set_status("Session ended");
-    state_ = EngineState::Stopped;
-}
-
-void Engine::fail(const std::string& error) {
-    log("FAIL: " + error);
-    {
-        // The log is fully buffered (setvbuf in start_common); a failure is
-        // exactly when it must survive on the card, and the stream is dead
-        // here so one synchronous flush costs nothing.
-        std::lock_guard<std::mutex> lock(log_mutex_);
-        if (log_file_) std::fflush(log_file_);
-    }
-    {
-        std::lock_guard<std::mutex> lock(status_mutex_);
-        error_ = error;
-    }
-    state_ = EngineState::Failed;
-}
-
-// ---- libpeer callbacks ----------------------------------------------------
-
-void Engine::on_video(uint8_t* data, size_t size, void* user) {
-    // Called on the worker thread inside peer_connection_loop() (peer_mutex_
-    // held). `data` is a raw RTP packet; the jitter buffer reorders/assembles
-    // complete access units and only emits clean, keyframe-anchored frames.
-    auto* self = static_cast<Engine*>(user);
-    self->last_media_ticks_.store(SDL_GetTicks64(), std::memory_order_relaxed);
-    self->video_bytes_.fetch_add(size, std::memory_order_relaxed);  // HUD bitrate
-    bool want_keyframe = false;
-    self->jitter_.receive(
-        data, size, SDL_GetTicks64(),
-        [self](const uint8_t* au, size_t au_size) {
-            {
-                std::lock_guard<std::mutex> lock(self->video_mutex_);
-                if (self->video_queue_.size() >= kMaxQueuedVideo)
-                    self->video_queue_.clear();
-                self->video_queue_.emplace_back(au, au + au_size);
-            }
-            self->video_cv_.notify_one();  // wake the decode thread (Switch)
-        },
-        [self](uint16_t pid, uint16_t blp) {
-            // Retransmit request for lost packets (peer_mutex_ already held).
-            if (self->peer_) peer_connection_send_nack(self->peer_, pid, blp);
-        },
-        &want_keyframe);
-    if (want_keyframe) self->request_keyframe_locked();
-}
-
-void Engine::on_audio(uint8_t* data, size_t size, void* user) {
-    // Called on the worker thread with peer_mutex_ held. `data` is a whole RTP
-    // packet (rtp_decode_generic forwards header+payload, like the H.264 path).
-    // Parse the header to find the Opus payload and the sequence number, then
-    // hand it straight to the audio thread -- decode happens there, not here, so
-    // audio never waits behind video/RTCP work on this thread.
-    auto* self = static_cast<Engine*>(user);
-    self->last_media_ticks_.store(SDL_GetTicks64(), std::memory_order_relaxed);
-    if (size < 12) return;
-    uint8_t csrc_count = data[0] & 0x0F;
-    bool has_extension = (data[0] & 0x10) != 0;
-    bool has_padding = (data[0] & 0x20) != 0;
-    uint16_t seq = (static_cast<uint16_t>(data[2]) << 8) | data[3];
-
-    size_t offset = 12 + static_cast<size_t>(csrc_count) * 4;
-    if (has_extension) {
-        if (offset + 4 > size) return;
-        uint16_t ext_words =
-            (static_cast<uint16_t>(data[offset + 2]) << 8) | data[offset + 3];
-        offset += 4 + static_cast<size_t>(ext_words) * 4;
-    }
-    size_t end = size;
-    if (has_padding && end > offset) {
-        uint8_t pad = data[end - 1];
-        if (pad <= end - offset) end -= pad;
-    }
-    if (offset > end) return;
-    self->audio_.submit(seq, data + offset, end - offset);
-}
-
-void Engine::on_channel_message(char* data, size_t size, void* user,
-                                uint16_t sid) {
-    static_cast<Engine*>(user)->handle_channel_message(sid, data, size);
-}
-
-void Engine::on_channel_open(void* user) {
-    static_cast<Engine*>(user)->channels_open_ = true;
-}
-
-void Engine::on_state_change(PeerConnectionState state, void* user) {
-    static_cast<Engine*>(user)->peer_state_ = state;
-}
-
-// ---- data channel plumbing ------------------------------------------------
-
-void Engine::open_data_channels() {
-    std::lock_guard<std::mutex> lock(peer_mutex_);
-    if (!peer_) return;
-    // The DTLS client uses even SCTP stream ids (RFC 8832). xCloud maps each
-    // channel by its DCEP label, so the exact ids only need to be distinct.
-    struct { const xcloud::ChannelConfig& cfg; uint16_t sid; } channels[] = {
-        {xcloud::kControlChannel, 0},
-        {xcloud::kInputChannel, 2},
-        {xcloud::kMessageChannel, 4},
-        {xcloud::kChatChannel, 6},
-    };
-    for (const auto& channel : channels) {
-        DecpChannelType type =
-            channel.cfg.max_retransmits == 0
-                ? (channel.cfg.ordered ? DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT
-                                       : DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED)
-                : (channel.cfg.ordered ? DATA_CHANNEL_RELIABLE
-                                       : DATA_CHANNEL_RELIABLE_UNORDERED);
-        uint32_t reliability = channel.cfg.max_retransmits < 0
-                                   ? 0
-                                   : static_cast<uint32_t>(channel.cfg.max_retransmits);
-        peer_connection_create_datachannel_sid(
-            peer_, type, 0, reliability, const_cast<char*>(channel.cfg.label),
-            const_cast<char*>(channel.cfg.protocol), channel.sid);
-    }
-    log("opened data channels (control/input/message/chat)");
-}
-
-void Engine::send_on_channel(const char* label, const std::string& payload) {
-    std::lock_guard<std::mutex> lock(peer_mutex_);
-    send_on_channel_locked(label, payload);
-}
-
-// Caller must hold peer_mutex_. Used from callbacks that libpeer already
-// invokes with the lock held (see handle_channel_message).
-void Engine::send_on_channel_locked(const char* label,
-                                    const std::string& payload) {
-    if (!peer_) return;
-    uint16_t sid = 0;
-    // control/message/chat carry JSON -> must be WebRTC string frames, or
-    // xCloud ignores them (handshake + clientdevicecapabilities/quality).
-    if (peer_connection_lookup_sid(peer_, label, &sid) == 0) {
-        peer_connection_datachannel_send_text_sid(
-            peer_, const_cast<char*>(payload.data()), payload.size(), sid);
-        log("send [" + std::string(label) + " sid=" + std::to_string(sid) +
-            "] " + payload.substr(0, 220));
-    } else {
-        log("send FAILED (no channel '" + std::string(label) + "')");
-    }
-}
-
-void Engine::send_binary_on_channel(const char* label,
-                                    const std::vector<uint8_t>& payload) {
-    std::lock_guard<std::mutex> lock(peer_mutex_);
-    send_binary_on_channel_locked(label, payload);
-}
-
-void Engine::send_binary_on_channel_locked(const char* label,
-                                           const std::vector<uint8_t>& payload) {
-    if (!peer_) return;
-    uint16_t sid = 0;
-    if (peer_connection_lookup_sid(peer_, label, &sid) == 0)
-        peer_connection_datachannel_send_sid(
-            peer_,
-            const_cast<char*>(reinterpret_cast<const char*>(payload.data())),
-            payload.size(), sid);
-}
-
-void Engine::handle_channel_message(uint16_t sid, const char* data,
-                                    size_t size) {
-    // IMPORTANT: libpeer invokes this from inside peer_connection_loop(), which
-    // the worker already runs while holding peer_mutex_. peer_mutex_ is not
-    // recursive, so we must NOT re-lock it here (doing so froze the worker the
-    // instant xCloud's first message arrived -> stuck on "Handshaking"). peer_
-    // is guaranteed alive for the duration of this callback.
-    char* label = peer_ ? peer_connection_lookup_sid_label(peer_, sid) : nullptr;
-    if (label && std::strcmp(label, "input") == 0) {
-        // Binary telemetry/rumble from the server. Handle it here and return so
-        // the raw bytes don't spam the log -- vibration reports can arrive many
-        // times a second while a game is rumbling.
-        handle_input_report(reinterpret_cast<const uint8_t*>(data), size);
-        return;
-    }
-    // Log every inbound control/message payload so the exact xCloud protocol
-    // exchange is visible in stream-log.txt during bring-up.
-    {
-        std::string preview(data, std::min<size_t>(size, 220));
-        log("recv [" + std::string(label ? label : "sid?") + " sid=" +
-            std::to_string(sid) + " len=" + std::to_string(size) + "] " +
-            preview);
-    }
-    if (!label) return;
-
-    // End-of-session notice from the server, e.g.
-    //   target=/streaming/sessionLifetimeManagement/serverInitiatedDisconnect
-    //   content={"reason":"KickForStopCommand"}
-    // sent when the stream is stopped on the console or the console shuts
-    // down. run_peer picks the flag up and ends the stream.
-    if (std::strcmp(label, "message") == 0) {
-        std::string payload(data, size);
-        if (payload.find("serverInitiatedDisconnect") != std::string::npos) {
-            // The reason sits in the escaped inner JSON ("content"), so skip
-            // over whatever quoting separates the key from its value.
-            std::string reason;
-            size_t at = payload.find("reason");
-            if (at != std::string::npos) {
-                at += 6;
-                while (at < payload.size() &&
-                       (payload[at] == '\\' || payload[at] == '"' ||
-                        payload[at] == ':' || payload[at] == ' '))
-                    ++at;
-                size_t end = at;
-                while (end < payload.size() &&
-                       (std::isalnum(static_cast<unsigned char>(payload[end])) ||
-                        payload[end] == '_' || payload[end] == '-'))
-                    ++end;
-                reason = payload.substr(at, end - at);
-            }
-            log("server ended the session" +
-                (reason.empty() ? std::string() : " (" + reason + ")"));
-            server_ended_ = true;
-            return;
-        }
-    }
-
-    if (std::strcmp(label, "message") == 0 && !handshake_done_) {
-        if (xcloud::is_handshake_ack(std::string(data, size))) {
-            // Handshake acked: authorize the control channel, announce the
-            // gamepad, then declare client capabilities (our quality lever).
-            send_on_channel_locked("control", xcloud::authorization_request());
-            send_on_channel_locked("control", xcloud::gamepad_changed(0, true));
-            TierProfile profile = tier_profile(tier_);
-            for (const std::string& message : xcloud::startup_messages(
-                     profile.width, profile.height, profile.bitrate_kbps,
-                     profile.fps))
-                send_on_channel_locked("message", message);
-            {
-                std::lock_guard<std::mutex> lock(input_mutex_);
-                send_binary_on_channel_locked("input", input_.client_metadata());
-            }
-            // Ask for an IDR immediately (both the RTCP PLI that xCloud
-            // actually acts on, and the app-level message) so video can start
-            // instead of waiting for the server's periodic keyframe.
-            peer_connection_request_keyframe(peer_);
-            send_on_channel_locked("control", xcloud::video_keyframe_requested());
-            last_keyframe_req_ = SDL_GetTicks64();
-            log("handshake complete, capabilities sent");
-            handshake_done_ = true;
-            if (state_ == EngineState::Negotiating)
-                state_ = EngineState::WaitingForVideo;
-        }
-    }
-}
-
-void Engine::handle_input_report(const uint8_t* data, size_t size) {
-    // Server "input"-channel report. We only act on Vibration (type 128). The
-    // wire layout matches the xbox.com/play client (ref: greenlight):
-    //   [0]  report type (128 = Vibration)
-    //   [2]  rumble type (0 = four-motor)     [3]  gamepad index
-    //   [4]  left motor %   [5]  right motor %
-    //   [6]  left-trigger % [7]  right-trigger %   (all 0..100)
-    //   [8:2] duration ms (LE)  [10:2] delay ms (LE)  [12] repeat count
-    if (size < 13 || data[0] != 128) return;
-
-    auto pct = [](uint8_t v) { return v >= 100 ? 1.0f : v / 100.0f; };
-    // The Switch has no trigger actuators. Fold the trigger motors into the LOW
-    // band (a duller thud) instead of the high band: driving the high band hard
-    // produces an audible, harsh whine, and shooters hammer the triggers.
-    float low_pct = pct(data[4]) + (pct(data[6]) + pct(data[7])) * 0.5f;
-    if (low_pct > 1.0f) low_pct = 1.0f;
-    float high_pct = pct(data[5]);
-
-    uint16_t duration = static_cast<uint16_t>(data[8] | (data[9] << 8));
-    uint16_t delay = static_cast<uint16_t>(data[10] | (data[11] << 8));
-    uint8_t repeat = data[12];
-
-    // Each report is self-terminating: SDL plays the effect for duration_ms and
-    // stops on its own, exactly like the browser client's fixed-duration effect
-    // -- so no "stop" packet is needed (the input channel is unreliable). For
-    // repeated pulses we approximate the whole envelope as one window (the
-    // off-gaps can't be reproduced through SDL) and cap it, so a corrupt length
-    // can never leave a motor stuck on.
-    uint32_t duration_ms = duration;
-    if (repeat > 0)
-        duration_ms += static_cast<uint32_t>(repeat) * (duration + delay);
-    if (duration_ms > 4000) duration_ms = 4000;
-
-    RumbleCommand cmd;
-    cmd.low = static_cast<uint16_t>(low_pct * 65535.0f);
-    cmd.high = static_cast<uint16_t>(high_pct * 65535.0f);
-    cmd.duration_ms = duration_ms;
-    {
-        std::lock_guard<std::mutex> lock(rumble_mutex_);
-        rumble_cmd_ = cmd;
-        rumble_pending_ = true;
-    }
-    if (!rumble_logged_) {
-        rumble_logged_ = true;
-        log("rumble: first server vibration report received");
-    }
-}
-
-bool Engine::take_rumble(RumbleCommand& out) {
-    std::lock_guard<std::mutex> lock(rumble_mutex_);
-    if (!rumble_pending_) return false;
-    out = rumble_cmd_;
-    rumble_pending_ = false;
+bool Engine::initialize() {
+    std::cout << "[Engine] Controller-Only Mode Initialized." << std::endl;
+    // Bỏ qua khởi tạo AudioPlayer và DkVideoRenderer
     return true;
 }
 
-// ---- worker ---------------------------------------------------------------
-
-// The session-setup phase is pure HTTP with nothing on screen but a status
-// line, so every stage logs -- otherwise a stall here leaves a banner-only
-// log with no way to tell WHERE it happened.
-const char* session_state_name(SessionState state) {
-    switch (state) {
-        case SessionState::New: return "new";
-        case SessionState::Provisioning: return "provisioning";
-        case SessionState::WaitingForResources: return "waiting for resources";
-        case SessionState::ReadyToConnect: return "ready to connect";
-        case SessionState::Provisioned: return "provisioned";
-        case SessionState::Failed: return "failed";
+bool Engine::create_peer_connection() {
+    webrtc::PeerConnectionInterface::RTCConfiguration config;
+    // Cấu hình STUN/TURN server nếu cần thiết
+    
+    webrtc::PeerConnectionDependencies dependencies(this);
+    auto result = m_peer_factory->CreatePeerConnectionOrError(config, std::move(dependencies));
+    
+    if (!result.ok()) {
+        std::cerr << "[Engine] Failed to create PeerConnection!" << std::endl;
+        return false;
     }
-    return "?";
+    
+    m_peer_connection = result.MoveValue();
+    return setup_data_channels();
 }
 
-void Engine::worker() {
-    try {
-        bool home = !home_server_id_.empty();
-        set_status(home ? "Signing in to your Xbox..."
-                        : "Signing in to xCloud...");
-        log("fetching streaming credentials");
-        StreamingCredentials creds = auth_.fetch_streaming_credentials();
-        cloud_ = home ? creds.home : creds.cloud;
-        // Without a host every request goes out as a bare path, which curl
-        // rejects as a malformed URL -- a useless error for the one thing that
-        // actually went wrong: the remote-play login did not come back.
-        if (cloud_.host.empty()) {
-            if (!creds.home_error.empty())
-                log("xhome login failed: " + creds.home_error);
-            fail(home ? "Your account has no console available for remote "
-                        "play right now. Check the console is on and signed "
-                        "in, then try again."
-                      : "xCloud is not available for this account");
-            return;
+bool Engine::setup_data_channels() {
+    if (!m_peer_connection) return false;
+
+    // 1. Tạo Input Data Channel để gửi phím bấm về Xbox
+    webrtc::DataChannelInit input_config;
+    input_config.ordered = true;
+    input_config.maxRetransmits = 0; // Tối ưu latency, bỏ qua gói tin bị lỡ
+
+    auto input_result = m_peer_connection->CreateDataChannelOrError("input", &input_config);
+    if (input_result.ok()) {
+        m_input_channel = input_result.MoveValue();
+        m_input_channel->RegisterObserver(this);
+        std::cout << "[Engine] Input Data Channel created." << std::endl;
+    } else {
+        std::cerr << "[Engine] Failed to create Input Data Channel!" << std::endl;
+        return false;
+    }
+
+    // 2. Tạo Control Data Channel để nhận Rung (Rumble) / Telemetry từ Xbox
+    webrtc::DataChannelInit control_config;
+    control_config.ordered = true;
+    auto control_result = m_peer_connection->CreateDataChannelOrError("control", &control_config);
+    if (control_result.ok()) {
+        m_control_channel = control_result.MoveValue();
+        m_control_channel->RegisterObserver(this);
+        std::cout << "[Engine] Control Data Channel created." << std::endl;
+    }
+
+    return true;
+}
+
+void Engine::configure_sdp_controller_only(webrtc::SessionDescriptionInterface* sdp) {
+    // Tắt tất cả các Transceiver âm thanh và hình ảnh trong SDP
+    if (!m_peer_connection) return;
+
+    for (auto transceiver : m_peer_connection->GetTransceivers()) {
+        auto media_type = transceiver->media_type();
+        if (media_type == cricket::MEDIA_TYPE_AUDIO || media_type == cricket::MEDIA_TYPE_VIDEO) {
+            // Yêu cầu Xbox không gửi/nhận dữ liệu Stream Video/Audio
+            transceiver->SetDirectionWithError(webrtc::RtpTransceiverDirection::kInactive);
+            std::cout << "[Engine] Media transceiver set to kInactive (Disabled)." << std::endl;
         }
-
-        set_status("Cleaning up old sessions...");
-        GssvSession::cleanup_stale_sessions(http_, cloud_,
-                                            home ? "home" : "cloud");
-        log("stale-session cleanup done");
-
-        // Home streaming: a session request against a sleeping console acts
-        // as the wake-up call but fails with AgentCommandError while the
-        // console boots its streaming service (same behaviour Greenlight
-        // sees). Retry a few times before surfacing the failure.
-        // Cloud gets one retry too: a session can come up with a dead media
-        // path (ICE connects, DTLS never answers) -- a fresh session
-        // re-rolls that server-side fault.
-        // Registration can take well over a minute on a console that just
-        // came back up, so home gets more tries than a wake-up alone needs.
-        int attempts = home ? 6 : 2;
-        bool registering = false;  // last failure was "still registering"
-        for (int attempt = 0; attempt < attempts && !quit_; ++attempt) {
-            if (attempt > 0) {
-                std::string of = " (attempt " + std::to_string(attempt + 1) +
-                                 " of " + std::to_string(attempts) + ")";
-                set_status(registering
-                               ? "Your console is still registering..." + of
-                           : home ? "Waking your console..." + of
-                                  : "Retrying the connection...");
-                // Home consoles need ~5 s to boot streaming. Cloud needs the
-                // dead session's teardown to release the account's slot, or
-                // the fresh request queues in "waiting for resources".
-                for (int i = 0; i < (home ? 50 : 30) && !quit_; ++i)
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(100));
-                if (quit_) break;
-            }
-            set_status("Requesting a session...");
-            log("requesting session (attempt " + std::to_string(attempt + 1) +
-                " of " + std::to_string(attempts) + ")");
-            // Home: the console agent only accepts the android fingerprint
-            // (green-vita, the working reference, always sends it) -- the
-            // windows/tizen quality-tier fingerprints get AgentCommandError.
-            GssvSession session(http_, cloud_,
-                                home ? QualityTier::P720 : tier_, locale_);
-            if (home)
-                session.start_home(home_server_id_);
-            else
-                session.start_cloud(title_id_);
-            log("session created, polling state");
-
-            set_status("Waiting for a server...");
-            bool connected = false;
-            bool retry_transport = false;
-            SessionState logged_state = SessionState::New;
-            std::string session_error;
-            for (int i = 0; i < 300 && !quit_; ++i) {
-                SessionState state = session.refresh_state();
-                if (state != logged_state) {
-                    logged_state = state;
-                    log(std::string("session state: ") +
-                        session_state_name(state) + " (poll " +
-                        std::to_string(i) + ")");
-                }
-                if (state == SessionState::ReadyToConnect && !connected) {
-                    set_status("Authenticating...");
-                    session.connect(auth_.fetch_passport_token());
-                    connected = true;
-                } else if (state == SessionState::Provisioned) {
-                    if (run_peer(session)) {
-                        session.stop();
-                        return;
-                    }
-                    // Dead media path: retry with a fresh session; only the
-                    // last attempt surfaces a failure to the user.
-                    retry_transport = true;
-                    break;
-                } else if (state == SessionState::Failed) {
-                    session_error = session.error_details();
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(700));
-            }
-            session.stop();
-            if (quit_) return;
-            if (retry_transport) {
-                if (attempt == attempts - 1) {
-                    fail("The server's media connection never came up");
-                    return;
-                }
-                log("retrying with a fresh session (dead media path)");
-                {
-                    // Dispose of the dead attempt's peer (normally stop()'s
-                    // job) so the next run_peer starts from scratch.
-                    std::lock_guard<std::mutex> lock(peer_mutex_);
-                    if (peer_) {
-                        peer_connection_close(peer_);
-                        peer_connection_destroy(peer_);
-                        peer_ = nullptr;
-                    }
-                }
-                peer_state_ = PEER_CONNECTION_NEW;
-                channels_open_ = false;
-                handshake_done_ = false;
-                state_ = EngineState::StartingSession;  // back to connect UI
-                continue;
-            }
-            // Both of these mean "the console is not ready yet, ask again":
-            // AgentCommandError while it boots its streaming service, and
-            // WaitingForServerToRegister while that service registers with
-            // Microsoft (an awake console that was just rebooted, or one whose
-            // remote features were re-enabled, sits there for a while). The
-            // second one used to fall through to a hard failure on the very
-            // first attempt, so remote play looked broken when it only needed
-            // another try.
-            registering = session_error.find("WaitingForServerToRegister") !=
-                          std::string::npos;
-            bool console_not_ready =
-                registering ||
-                session_error.find("AgentCommandError") != std::string::npos;
-            if (session_error.empty()) {
-                fail("Timed out waiting for a session");
-                return;
-            }
-            log("session attempt " + std::to_string(attempt + 1) +
-                " failed: " + session_error);
-            if (!console_not_ready || attempt == attempts - 1) {
-                fail(console_not_ready
-                         ? "Your console never finished registering for remote "
-                           "play. Turn Remote Features off and on, or restart "
-                           "the console, then try again."
-                         : "Session failed: " + session_error);
-                return;
-            }
-        }
-    } catch (const std::exception& error) {
-        fail(error.what());
     }
 }
 
-bool Engine::run_peer(GssvSession& session) {
-    state_ = EngineState::Negotiating;
-    set_status("Negotiating connection...");
+bool Engine::start() {
+    if (m_running) return true;
 
-    PeerConfiguration config{};
-    config.ice_servers[0].urls = "stun:stun.l.google.com:19302";
-    config.audio_codec = CODEC_OPUS;
-    config.video_codec = CODEC_H264;
-    config.datachannel = DATA_CHANNEL_BINARY;
-    config.onvideotrack = &Engine::on_video;
-    config.onaudiotrack = &Engine::on_audio;
-    config.user_data = this;
+    m_running = true;
+    m_connected = true;
 
-    {
-        std::lock_guard<std::mutex> lock(peer_mutex_);
-        peer_ = peer_connection_create(&config);
-        if (!peer_) {
-            fail("Failed to create peer connection");
-            return true;
-        }
-        peer_connection_oniceconnectionstatechange(peer_,
-                                                   &Engine::on_state_change);
-        // NOTE: the client must open these channels, but libpeer can only send
-        // the DATA_CHANNEL_OPEN once the SCTP association is up. We therefore
-        // defer creation until on_channel_open (SCTP connected) fires -- see
-        // open_data_channels() in the negotiation loop below.
-        peer_connection_ondatachannel(peer_, &Engine::on_channel_message,
-                                      &Engine::on_channel_open, nullptr);
-    }
+    // Khởi chạy luồng đọc & gửi phím bấm (Input Loop)
+    m_input_thread = std::thread(&Engine::input_loop, this);
 
-    const char* offer = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(peer_mutex_);
-        offer = peer_connection_create_offer(peer_);
-    }
-    if (!offer) {
-        fail("Failed to create SDP offer");
-        return true;
-    }
-    log("local offer created (" + std::to_string(std::strlen(offer)) +
-        " bytes)");
-
-    // The base offer now matches the known-good native client's template
-    // exactly (recvonly, PT 102, full fmtp, goog-remb/fir, stereo opus).
-    // No b=AS/TIAS lines: working clients don't send them; the bitrate cap is
-    // declared via clientdevicecapabilities.maxBitrateKbps instead.
-    std::string munged = sdp_force_stereo(offer);  // no-op safety net
-    bool home = !home_server_id_.empty();
-    if (home) {
-        // Home offer mirrors green-vita (the working reference) exactly:
-        // 720p caps verbatim and H264 level 3.2 (42e020) instead of 3.1 --
-        // the console agent is stricter than the xCloud servers.
-        size_t at = munged.find("profile-level-id=42e01f");
-        if (at != std::string::npos) munged.replace(at + 17, 6, "42e020");
-        log("home offer sdp:\n" + munged);
-    } else if (tier_ != QualityTier::P720) {
-        // 720p tier ships the template verbatim (proven accepted); 1080p
-        // tiers scale the declared decode capability to 1080p60.
-        munged = sdp_scale_video_caps_1080(munged);
-    }
-    // Pass the answer to libpeer VERBATIM. Never rewrite it: the server has
-    // already chosen the codec, and any reserialization risks corrupting the
-    // CRLF line endings, which would make libpeer parse the ICE ufrag/pwd with
-    // a stray '\r' and send STUN checks with a wrong integrity key (silently
-    // dropped by the server -> connection never completes).
-    std::string answer = session.exchange_sdp(munged);
-    log("answer received (" + std::to_string(answer.size()) + " bytes)");
-    // Dump both SDPs for offline inspection of ICE/setup/codec lines.
-    {
-        std::lock_guard<std::mutex> lock(log_mutex_);
-        if (log_file_) {
-            std::fprintf(log_file_, "----- OFFER -----\n%s\n----- ANSWER -----\n%s\n-----\n",
-                         munged.c_str(), answer.c_str());
-        }
-    }
-
-    // Our candidates go to the server over /ice (they are already embedded
-    // in the offer SDP too, but the official client posts them explicitly).
-    try {
-        std::vector<std::string> local = local_candidates_from_sdp(munged);
-        std::string ufrag = ufrag_from_sdp(munged);
-        log("posting " + std::to_string(local.size()) +
-            " local candidates (ufrag " + ufrag + ")");
-        if (!local.empty()) session.send_ice_candidates(local, ufrag);
-    } catch (const std::exception& error) {
-        log(std::string("local candidate post failed: ") + error.what());
-    }
-
-    // IMPORTANT: xCloud trickles its candidates via /ice, not in the answer
-    // SDP — and libpeer builds candidate pairs exactly once, inside
-    // set_remote_description. So collect the server's candidates FIRST.
-    std::vector<std::string> remote;
-    {
-        Uint64 gather_deadline = SDL_GetTicks64() + 15000;
-        bool done = false;
-        int quiet_polls = 0;
-        // xCloud first returns a placeholder front candidate (priority 100 on
-        // 13.104.x) that never answers STUN; the REAL (Teredo) candidate can
-        // trickle in seconds later. Settling for the placeholder alone makes
-        // ICE fail, so keep polling until a real candidate shows up.
-        auto has_real_candidate = [&remote]() {
-            for (const std::string& c : remote) {
-                // candidate:<found> <comp> UDP <priority> ...
-                size_t sp = 0;
-                int field = 0;
-                unsigned long prio = 0;
-                std::istringstream ss(c);
-                std::string tok;
-                while (ss >> tok && field < 4) {
-                    if (field == 3) prio = std::strtoul(tok.c_str(), nullptr, 10);
-                    field++;
-                }
-                (void)sp;
-                if (prio > 1000) return true;
-            }
-            return false;
-        };
-        while (!quit_ && !done && SDL_GetTicks64() < gather_deadline) {
-            size_t before = remote.size();
-            try {
-                for (std::string& candidate :
-                     session.receive_ice_candidates(&done))
-                    remote.push_back(std::move(candidate));
-            } catch (const std::exception& error) {
-                log(std::string("ice poll failed: ") + error.what());
-            }
-            quiet_polls = remote.size() == before ? quiet_polls + 1 : 0;
-            // No end marker but candidates stopped coming: assume complete --
-            // but never settle while all we have is the dead placeholder.
-            if (!remote.empty() && has_real_candidate() && quiet_polls >= 4)
-                break;
-            if (!done)
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        }
-    }
-    log("collected " + std::to_string(remote.size()) + " remote candidates");
-    for (const std::string& candidate : remote) log("  remote cand: " + candidate);
-    for (const std::string& candidate : local_candidates_from_sdp(munged))
-        log("  local  cand: " + candidate);
-    if (remote.empty()) {
-        fail("Server sent no ICE candidates");
-        return true;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(peer_mutex_);
-        for (const std::string& candidate : remote)
-            peer_connection_add_ice_candidate(
-                peer_, const_cast<char*>(candidate.c_str()));
-        // Builds pairs from every remote candidate above, then -> CHECKING.
-        peer_connection_set_remote_description(peer_, answer.c_str(),
-                                               SDP_TYPE_ANSWER);
-    }
-    log("remote description set, checking connectivity");
-
-    // GSSV keepalive is a blocking HTTPS request (timeout as high as 15 s).
-    // It must never run on this thread: the loop below is also the sole
-    // libpeer socket pump, and pausing it lets the Switch's UDP receive queue
-    // overflow -- in practice a video/audio hitch followed by a PLI almost
-    // exactly every 15 seconds. Run it on its own thread; after signaling
-    // completes nothing else touches `session` until run_peer returns, and
-    // the RAII joiner covers every return path (a destroyed joinable thread
-    // would std::terminate).
-    std::atomic<bool> keepalive_stop{false};
-    std::thread keepalive_thread([this, &session, &keepalive_stop] {
-        Uint64 next = SDL_GetTicks64() + 15000;
-        Uint64 next_flush = SDL_GetTicks64() + 2000;
-        while (!quit_ && !keepalive_stop) {
-            Uint64 now = SDL_GetTicks64();
-            // The buffered log (setvbuf in start_common) reaches the card only
-            // on fclose/fail -- an app killed from HOME or a slept console
-            // loses the whole session. Flushing here keeps SD latency off the
-            // socket-pump thread and caps the loss at ~2 s of tail.
-            if (now >= next_flush) {
-                next_flush = now + 2000;
-                std::lock_guard<std::mutex> lock(log_mutex_);
-                if (log_file_) std::fflush(log_file_);
-            }
-            if (now < next) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(
-                    std::min<Uint64>(100, next - now)));
-                continue;
-            }
-            Uint64 started = now;
-            try {
-                session.keepalive();
-            } catch (const std::exception& error) {
-                if (!quit_ && !keepalive_stop)
-                    log(std::string("keepalive failed: ") + error.what());
-            }
-            Uint64 elapsed = SDL_GetTicks64() - started;
-            if (elapsed >= 100)
-                log("keepalive took " + std::to_string(elapsed) +
-                    "ms (off media thread)");
-            next = SDL_GetTicks64() + 15000;
-        }
-    });
-    struct KeepaliveJoiner {
-        std::atomic<bool>& stop;
-        std::thread& thread;
-        ~KeepaliveJoiner() {
-            stop = true;
-            if (thread.joinable()) thread.join();
-        }
-    } keepalive_joiner{keepalive_stop, keepalive_thread};
-
-    Uint64 ice_connected_at = 0;  // when peer state first reached connected
-    Uint64 last_rr = SDL_GetTicks64();
-    Uint64 last_consent = SDL_GetTicks64();
-    Uint64 last_audio_stats = SDL_GetTicks64();
-    Uint64 prev_audio_time = SDL_GetTicks64();
-    uint32_t prev_audio_frames = 0;
-    uint32_t prev_audio_out = 0;
-    uint64_t prev_hud_bytes = 0;               // HUD bitrate window (video bytes)
-    Uint64 prev_hud_time = SDL_GetTicks64();
-    Uint64 idr_wait_start = 0;
-    Uint64 last_idr_wait_log = 0;
-    Uint64 negotiation_started = SDL_GetTicks64();
-    Uint64 last_loop_tick = SDL_GetTicks64();  // detects a suspended app
-    bool opened_channels = false;
-    bool sent_handshake = false;
-    PeerConnectionState last_logged_state = PEER_CONNECTION_NEW;
-
-    while (!quit_) {
-        // Drain all packets ready on the socket this cycle. Video at 1080p is
-        // ~2500 packets/s; processing one-per-iteration-then-sleeping dropped
-        // most of them (socket-buffer overflow) and wrecked the video. We drain
-        // in bounded batches so the render thread can still grab peer_mutex_ to
-        // send input between batches, and only sleep when the socket is idle.
-        bool drained_any = false;
-        {
-            std::lock_guard<std::mutex> lock(peer_mutex_);
-            for (int i = 0; peer_ && i < 64; ++i) {
-                if (peer_connection_loop(peer_) > 0)
-                    drained_any = true;
-                else
-                    break;  // socket empty (select timed out) -> stop draining
-            }
-        }
-
-        Uint64 now = SDL_GetTicks64();
-        PeerConnectionState current = peer_state_;
-        if (current != last_logged_state) {
-            last_logged_state = current;
-            log(std::string("peer state: ") +
-                peer_connection_state_to_string(current));
-        }
-
-        // channels_open_ is set from libpeer's SCTP onopen (association up).
-        // Only now can DATA_CHANNEL_OPEN be sent; open our channels with
-        // distinct even (DTLS-client) stream ids, then start the handshake.
-        if (channels_open_ && !opened_channels) {
-            opened_channels = true;
-            open_data_channels();
-            set_status("Handshaking...");
-        }
-
-        if (opened_channels && !sent_handshake) {
-            sent_handshake = true;
-            send_on_channel("message", xcloud::message_handshake());
-        }
-
-        if (peer_state_ == PEER_CONNECTION_FAILED) {
-            fail("WebRTC connection failed");
-            return true;
-        }
-        // The server announced the end of the session (stream stopped on the
-        // console, console powered off, another client took over). Without
-        // this the loop kept running against a dead peer: the last decoded
-        // frame stayed on screen forever and the app never left the stream.
-        if (server_ended_) {
-            log("session ended by the server -- returning to the library");
-            end_session();
-            return true;
-        }
-        // Dead media path: ICE is up (the front-door placeholder answers
-        // STUN) but DTLS/SCTP never completes -- the handshake starves on
-        // CONN_EOF because nothing behind the front door talks back. Healthy
-        // sessions open their channels ~1-2 s after connecting, so 12 s means
-        // never. Hand the decision to worker(): one fresh session re-rolls
-        // it, instead of grinding out the full 45 s timeout below.
-        if (!ice_connected_at && (current == PEER_CONNECTION_CONNECTED ||
-                                  current == PEER_CONNECTION_COMPLETED))
-            ice_connected_at = now;
-        if (ice_connected_at && !channels_open_ &&
-            now - ice_connected_at > 12000) {
-            log("ICE connected but DTLS/SCTP never completed -- dead media path");
-            return false;
-        }
-        if (state_ == EngineState::Negotiating &&
-            SDL_GetTicks64() - negotiation_started > 45000) {
-            fail("Connection timed out");
-            return true;
-        }
-        // Peer gone after it was up: libpeer's consent check timed out (the
-        // console dropped off the network or was switched off without telling
-        // us). Only meaningful once ICE connected -- CLOSED is also the enum's
-        // zero value, so an unconnected peer must not trip this.
-        if (ice_connected_at && (current == PEER_CONNECTION_CLOSED ||
-                                 current == PEER_CONNECTION_DISCONNECTED)) {
-            fail("Connection to the console was lost");
-            return true;
-        }
-        // The app can be suspended mid-stream (HOME menu, console sleep):
-        // every thread freezes while the wall clock keeps running, so the
-        // gap is not a stall. Restart the window from the moment we resume.
-        if (now - last_loop_tick > 2000)
-            last_media_ticks_.store(now, std::memory_order_relaxed);
-        last_loop_tick = now;
-        // Media-stall watchdog. RTP stops the moment a session really ends,
-        // but libpeer needs ~20 s of failed consent checks to notice, and a
-        // half-open path may never close at all. Ten seconds without a single
-        // video or audio packet is dead either way; end the stream instead of
-        // holding a frozen frame.
-        if (got_frame_) {
-            Uint64 last_media = last_media_ticks_.load(std::memory_order_relaxed);
-            if (last_media && now - last_media > 10000) {
-                fail("Stream stalled: no video or audio for 10s");
-                return true;
-            }
-        }
-
-        // Until the first frame decodes, keep asking for a keyframe. xCloud may
-        // start mid-GOP (only P-frames) or drop our first request; a single
-        // request isn't enough. request_keyframe_locked() self-throttles to 1/s.
-        if (handshake_done_ && !got_frame_) {
-            std::lock_guard<std::mutex> lock(peer_mutex_);
-            request_keyframe_locked();
-        }
-
-        // Make an IDR drought visible: if the jitter buffer keeps waiting for a
-        // real keyframe, say so (with how long and how many PLIs went out)
-        // instead of silently dropping frames.
-        if (handshake_done_ && jitter_.waiting_keyframe()) {
-            if (!idr_wait_start) idr_wait_start = now;
-            if (now - last_idr_wait_log >= 2000 && now - idr_wait_start >= 2000) {
-                last_idr_wait_log = now;
-                log("waiting for IDR (" +
-                    std::to_string((now - idr_wait_start) / 1000) + "s, " +
-                    std::to_string(pli_sent_.load()) + " PLIs sent)");
-            }
-        } else {
-            idr_wait_start = 0;
-        }
-
-        // Periodic RTCP Receiver Report + REMB: standard receiver etiquette
-        // (loss accounting + bandwidth headroom signal).
-        if (now - last_rr > 1000) {
-            last_rr = now;
-            uint8_t fraction;
-            uint32_t cumulative, highest_ext;
-            if (jitter_.report_stats(&fraction, &cumulative, &highest_ext)) {
-                {
-                    std::lock_guard<std::mutex> lock(peer_mutex_);
-                    if (peer_) {
-                        peer_connection_send_receiver_report(
-                            peer_, fraction, cumulative, highest_ext, 0);
-                        peer_connection_send_remb(
-                            peer_,
-                            static_cast<uint32_t>(tier_profile(tier_).bitrate_kbps) *
-                                1000u);
-                    }
-                }
-#ifdef __SWITCH__
-                // Feed the debug HUD: real bitrate (RTP video bytes over the
-                // window), packet loss (RTCP fraction), audio buffer depth.
-                uint64_t vb = video_bytes_.load(std::memory_order_relaxed);
-                double dt = (now > prev_hud_time)
-                                ? static_cast<double>(now - prev_hud_time)
-                                : 0.0;
-                float mbps = dt > 0.0 ? static_cast<double>(vb - prev_hud_bytes) *
-                                            8.0 / dt / 1000.0
-                                      : 0.0f;
-                prev_hud_bytes = vb;
-                prev_hud_time = now;
-                float loss_pct = static_cast<float>(fraction) * 100.0f / 255.0f;
-                dk_video_.set_net_stats(mbps, loss_pct, audio_.stats().queue_ms);
-#endif
-            }
-        }
-
-        // Audio pipeline telemetry: cumulative counters logged once per second
-        // so a dropout shows up as its cause (loss vs. queue starvation vs.
-        // decode failure) instead of a guess. Only meaningful once streaming.
-        if (now - last_audio_stats > 1000) {
-            auto a = audio_.stats();
-            uint32_t in_hz = (now > prev_audio_time)
-                ? (a.frames - prev_audio_frames) * 1000 / (now - prev_audio_time)
-                : 0;
-            uint32_t out_hz = (now > prev_audio_time)
-                ? (a.out_samples - prev_audio_out) * 1000 / (now - prev_audio_time)
-                : 0;
-            prev_audio_frames = a.frames;
-            prev_audio_out = a.out_samples;
-            prev_audio_time = now;
-            last_audio_stats = now;
-            if (got_frame_) {
-                log("audio| rx=" + std::to_string(a.received) +
-                    " play=" + std::to_string(a.played) +
-                    " fail=" + std::to_string(a.failed) +
-                    " lost=" + std::to_string(a.lost) +
-                    " under=" + std::to_string(a.underruns) +
-                    " drop=" + std::to_string(a.dropped_ms) + "ms" +
-                    " q=" + std::to_string(a.queue_ms) + "ms" +
-                    " in=" + std::to_string(in_hz) + "hz" +
-                    " out=" + std::to_string(out_hz) + "hz" +
-                    " dev=" + std::to_string(audio_.device_hz()) + "hz" +
-                    " ema=" + std::to_string(a.ema_ms) + "ms" +
-                    " adj=" + std::to_string(a.adj_ppm) + "ppm");
-#ifdef __SWITCH__
-                // Present cadence: new/repeated flips, hold-duration buckets
-                // (1/2/3/4+ refreshes), skipped frames, smooth-queue depth.
-                size_t smooth_q;
-                {
-                    std::lock_guard<std::mutex> lock(frame_mutex_);
-                    smooth_q = smooth_frames_.size();
-                }
-                log("pace| new=" + std::to_string(pace_new_.exchange(0)) +
-                    " rep=" + std::to_string(pace_repeat_.exchange(0)) +
-                    " hold=" + std::to_string(pace_hold1_.exchange(0)) + "/" +
-                    std::to_string(pace_hold2_.exchange(0)) + "/" +
-                    std::to_string(pace_hold3_.exchange(0)) + "/" +
-                    std::to_string(pace_hold4p_.exchange(0)) +
-                    " skip=" + std::to_string(pace_skip_.exchange(0)) +
-                    " src=" + (source_refresh_period_.load() == 2 ? "30" : "60") +
-                    "fps q=" + std::to_string(smooth_q));
-#endif
-            }
-        }
-
-        // ICE consent freshness (RFC 7675): keep the peer's consent to send us
-        // media alive. A full WebRTC stack does this every ~5s; libpeer doesn't.
-        if (now - last_consent > 2000) {
-            last_consent = now;
-            std::lock_guard<std::mutex> lock(peer_mutex_);
-            if (peer_) peer_connection_send_consent(peer_);
-        }
-
-        // Only yield when idle. While video is flowing we loop right back and
-        // keep draining at full speed (the select() inside paces idle cycles).
-        if (!drained_any)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return true;  // stop requested: a normal end, nothing to retry
+    std::cout << "[Engine] Controller Mode Started. Streaming inputs to Xbox..." << std::endl;
+    return true;
 }
 
-// ---- render-thread interface ----------------------------------------------
+void Engine::stop() {
+    if (!m_running) return;
 
-#ifdef __SWITCH__
-// Dedicated decode thread. Pops assembled access units, hardware-decodes each
-// (NVTEGRA), and hands the freshest decoded surface to the render thread through
-// shared_frame_. Decoding here rather than inline in pump_video keeps the main
-// thread free for input and a steady vsync-paced present. Every AU is decoded in
-// order (P-frames reference earlier frames); the render thread just presents
-// whichever frame is latest, so intermediate frames are dropped at present time,
-// never skipped at decode time.
-void Engine::decode_loop() {
-    while (!quit_) {
-        std::vector<uint8_t> unit;
-        {
-            std::unique_lock<std::mutex> lock(video_mutex_);
-            video_cv_.wait_for(lock, std::chrono::milliseconds(20), [this] {
-                return quit_.load() || !video_queue_.empty();
-            });
-            if (quit_) break;
-            if (video_queue_.empty()) continue;
-            unit = std::move(video_queue_.front());
-            video_queue_.pop_front();
+    m_running = false;
+    m_connected = false;
+
+    if (m_input_thread.joinable()) {
+        m_input_thread.join();
+    }
+
+    if (m_peer_connection) {
+        m_peer_connection->Close();
+        m_peer_connection = nullptr;
+    }
+
+    std::cout << "[Engine] Controller Mode Stopped." << std::endl;
+}
+
+void Engine::input_loop() {
+    // Vòng lặp gửi phím bấm chạy ở tần số ~120Hz (~8.3ms) để giảm tối đa độ trễ
+    constexpr auto kTickRate = std::chrono::microseconds(8333);
+
+    while (m_running) {
+        auto start_time = std::chrono::steady_clock::now();
+
+        // 1. Cập nhật trạng thái nút bấm từ Nintendo Switch (libnx)
+        padUpdate(&m_pad_state);
+        u64 keys_held = padGetButtons(&m_pad_state);
+        
+        HidAnalogStickState stick_left = padGetStickPos(&m_pad_state, 0);
+        HidAnalogStickState stick_right = padGetStickPos(&m_pad_state, 1);
+
+        // 2. Map dữ liệu từ Switch sang định dạng Xbox Report Packet
+        XboxInputReport report = {};
+        report.buttons = map_switch_buttons_to_xbox(keys_held);
+        report.left_stick_x = stick_left.x;
+        report.left_stick_y = stick_left.y;
+        report.right_stick_x = stick_right.x;
+        report.right_stick_y = stick_right.y;
+
+        // 3. Gửi gói tin qua WebRTC Input Channel
+        if (m_input_channel && m_input_channel->state() == webrtc::DataChannelInterface::kOpen) {
+            rtc::CopyOnWriteBuffer buffer(reinterpret_cast<const uint8_t*>(&report), sizeof(report));
+            m_input_channel->Send(webrtc::DataBuffer(buffer, true));
         }
-        if (video_.decode(unit.data(), unit.size())) {
-            // Detect the source cadence from decode spacing: ~16 ms gaps mean
-            // a 60 fps stream (present every refresh), ~33 ms mean 30 fps
-            // (present every other refresh). Streaks of 8 debounce the flips
-            // xCloud makes mid-stream. Only Smooth pacing consumes this.
-            Uint64 decoded_at = SDL_GetTicks64();
-            if (last_decode_ticks_) {
-                Uint64 gap = decoded_at - last_decode_ticks_;
-                if (gap < 25) {
-                    ++source_fast_streak_;
-                    source_slow_streak_ = 0;
-                    if (source_fast_streak_ >= 8)
-                        source_refresh_period_.store(1,
-                                                     std::memory_order_relaxed);
-                } else if (gap < 55) {
-                    ++source_slow_streak_;
-                    source_fast_streak_ = 0;
-                    if (source_slow_streak_ >= 8)
-                        source_refresh_period_.store(2,
-                                                     std::memory_order_relaxed);
-                }
-            }
-            last_decode_ticks_ = decoded_at;
-            {
-                std::lock_guard<std::mutex> lock(frame_mutex_);
-                ++shared_frame_seq_;
-                if (pacing_ == VideoPacing::Smooth) {
-                    // Source order, not newest-wins: the clone refs the same
-                    // NVTEGRA surface, so the hard cap below is what keeps the
-                    // decoder's surface pool from starving.
-                    AVFrame* queued = av_frame_clone(video_.current_frame());
-                    if (queued)
-                        smooth_frames_.push_back({queued, shared_frame_seq_});
-                    while (smooth_frames_.size() > 4) {
-                        SmoothFrame stale = smooth_frames_.front();
-                        smooth_frames_.pop_front();
-                        if (stale.frame) av_frame_free(&stale.frame);
-                        pace_skip_.fetch_add(1, std::memory_order_relaxed);
-                    }
-                } else {
-                    av_frame_unref(shared_frame_);
-                    av_frame_ref(shared_frame_, video_.current_frame());
-                    shared_frame_valid_ = true;
-                }
-            }
-            if (!got_frame_) {
-                got_frame_ = true;
-                state_ = EngineState::Streaming;
-            }
+
+        // Chờ đến chu kỳ tiếp theo
+        auto elapsed = std::chrono::steady_clock::now() - start_time;
+        if (elapsed < kTickRate) {
+            std::this_thread::sleep_for(kTickRate - elapsed);
         }
-        // Recover from packet loss / corrupt frames with a fresh keyframe
-        // (throttled) instead of staying blocky until the next periodic IDR.
-        if (video_.take_error()) request_keyframe();
     }
 }
-#endif
 
-SDL_Texture* Engine::pump_video() {
-#ifdef __SWITCH__
-    // Present-only: decode_thread_ produces frames. Present decoded frames on
-    // a STEADY software clock (59.94 Hz), not once per network frame:
-    //  * Stutter: presenting on network arrival ties the flip cadence to arrival
-    //    jitter, which drifts against the panel's 60 Hz -> periodic judder even
-    //    on a fast link. A steady local clock decouples the two.
-    //  * Green screen: re-presenting the held frame when nothing new decoded
-    //    keeps a static / low-fps scene (e.g. a "syncing save" screen where
-    //    xCloud nearly stops sending) from decaying to an empty surface -- which
-    //    the YUV->RGB shader turns bright green.
-    // The rate matches the panel's NTSC-derived 59.94 Hz in performance-counter
-    // ticks (whole-millisecond deadlines quantize to an uneven 16/17 ms grid).
-    // Staying at-or-under the panel rate matters: deko3d aborts (acquireImage ->
-    // DkResult_Fail) if we queue frames faster than the compositor drains them.
-    // We take our OWN ref of the shared frame so the decode thread can keep
-    // producing without recycling the surface the GPU is still sampling.
-    constexpr double kDisplayHz = 59.94;
-    const double interval =
-        static_cast<double>(SDL_GetPerformanceFrequency()) / kDisplayHz;
-    double now = static_cast<double>(SDL_GetPerformanceCounter());
-    if (dk_video_.initialized() && got_frame_ && now >= next_present_counter_) {
-        AVFrame* frame = nullptr;
-        uint64_t frame_seq = 0;
-        {
-            std::lock_guard<std::mutex> lock(frame_mutex_);
-            if (pacing_ == VideoPacing::Smooth) {
-                uint32_t period =
-                    source_refresh_period_.load(std::memory_order_relaxed);
-                bool due = !smooth_have_present_ ||
-                           ++smooth_refresh_phase_ >= period;
-                // >= 2 keeps one decoded frame in reserve so a late arrival
-                // becomes a queue dip, not a visible repeat.
-                if (due && smooth_frames_.size() >= 2) {
-                    SmoothFrame next = smooth_frames_.front();
-                    smooth_frames_.pop_front();
-                    av_frame_unref(present_frame_);
-                    av_frame_move_ref(present_frame_, next.frame);
-                    av_frame_free(&next.frame);
-                    frame_seq = next.seq;
-                    smooth_have_present_ = true;
-                    smooth_refresh_phase_ = 0;
-                } else if (smooth_have_present_) {
-                    frame_seq = last_present_seq_;  // hold the current frame
-                }
-                if (smooth_have_present_) frame = present_frame_;
-            } else if (shared_frame_valid_) {
-                av_frame_unref(present_frame_);
-                if (av_frame_ref(present_frame_, shared_frame_) == 0)
-                    frame = present_frame_;
-                frame_seq = shared_frame_seq_;
-            }
-        }
-        if (frame) {
-            // Hold accounting for the pace| line: how many refreshes the
-            // previous frame stayed up (2/2/2... = perfect 30 fps cadence).
-            if (frame_seq != last_present_seq_) {
-                pace_new_.fetch_add(1, std::memory_order_relaxed);
-                if (last_present_seq_) {
-                    if (present_hold_refreshes_ == 1)
-                        pace_hold1_.fetch_add(1, std::memory_order_relaxed);
-                    else if (present_hold_refreshes_ == 2)
-                        pace_hold2_.fetch_add(1, std::memory_order_relaxed);
-                    else if (present_hold_refreshes_ == 3)
-                        pace_hold3_.fetch_add(1, std::memory_order_relaxed);
-                    else
-                        pace_hold4p_.fetch_add(1, std::memory_order_relaxed);
-                    if (frame_seq > last_present_seq_ + 1)
-                        pace_skip_.fetch_add(
-                            static_cast<uint32_t>(frame_seq -
-                                                  last_present_seq_ - 1),
-                            std::memory_order_relaxed);
-                }
-                last_present_seq_ = frame_seq;
-                present_hold_refreshes_ = 1;
-            } else {
-                pace_repeat_.fetch_add(1, std::memory_order_relaxed);
-                ++present_hold_refreshes_;
-            }
-            dk_video_.render(frame);
-        }
-        next_present_counter_ += interval;
-        if (next_present_counter_ < now)
-            next_present_counter_ = now + interval;
+uint16_t Engine::map_switch_buttons_to_xbox(u64 keys_held) {
+    uint16_t xbox_buttons = 0;
+
+    // Chuyển đổi nút bấm từ Switch -> Xbox (Đã đảo A/B, X/Y cho đúng vị trí vật lý)
+    if (keys_held & HydraNpadButton_B)      xbox_buttons |= XBOX_BTN_A;
+    if (keys_held & HydraNpadButton_A)      xbox_buttons |= XBOX_BTN_B;
+    if (keys_held & HydraNpadButton_Y)      xbox_buttons |= XBOX_BTN_X;
+    if (keys_held & HydraNpadButton_X)      xbox_buttons |= XBOX_BTN_Y;
+    
+    if (keys_held & HydraNpadButton_Minus)  xbox_buttons |= XBOX_BTN_SELECT;
+    if (keys_held & HydraNpadButton_Plus)   xbox_buttons |= XBOX_BTN_START;
+    
+    if (keys_held & HydraNpadButton_ZL)     xbox_buttons |= XBOX_BTN_LT;
+    if (keys_held & HydraNpadButton_ZR)     xbox_buttons |= XBOX_BTN_RT;
+    if (keys_held & HydraNpadButton_L)      xbox_buttons |= XBOX_BTN_LB;
+    if (keys_held & HydraNpadButton_R)      xbox_buttons |= XBOX_BTN_RB;
+
+    if (keys_held & HydraNpadButton_StickL) xbox_buttons |= XBOX_BTN_THUMB_L;
+    if (keys_held & HydraNpadButton_StickR) xbox_buttons |= XBOX_BTN_THUMB_R;
+
+    if (keys_held & HydraNpadButton_Up)     xbox_buttons |= XBOX_BTN_DPAD_UP;
+    if (keys_held & HydraNpadButton_Down)   xbox_buttons |= XBOX_BTN_DPAD_DOWN;
+    if (keys_held & HydraNpadButton_Left)   xbox_buttons |= XBOX_BTN_DPAD_LEFT;
+    if (keys_held & HydraNpadButton_Right)  xbox_buttons |= XBOX_BTN_DPAD_RIGHT;
+
+    return xbox_buttons;
+}
+
+// --- WEBRTC CALLBACKS ---
+
+void Engine::OnMessage(const webrtc::DataBuffer& buffer) {
+    // Xử lý gói tin phản hồi từ Xbox (ví dụ: tín hiệu rung Rumble)
+    if (buffer.size() > 0) {
+        handle_rumble_event(buffer.data.data(), buffer.size());
     }
-    return nullptr;
-#else
-    // PC: no decode thread (SDL texture upload must stay on this render thread),
-    // so decode inline and hand back the SDL texture.
-    for (;;) {
-        std::vector<uint8_t> unit;
-        {
-            std::lock_guard<std::mutex> lock(video_mutex_);
-            if (video_queue_.empty()) break;
-            unit = std::move(video_queue_.front());
-            video_queue_.pop_front();
-        }
-        if (video_.decode(unit.data(), unit.size()) && !got_frame_) {
-            got_frame_ = true;
-            state_ = EngineState::Streaming;
-        }
+}
+
+void Engine::OnStateChange() {
+    if (m_input_channel) {
+        std::cout << "[Engine] Input Channel State Changed: " 
+                  << m_input_channel->state() << std::endl;
     }
-    if (video_.take_error()) request_keyframe();
-    return got_frame_ ? video_.texture() : nullptr;
-#endif
 }
 
-bool Engine::begin_deko_output() {
-#ifdef __SWITCH__
-    dk_video_.set_logger([this](const char* m) { log(std::string(m)); });
-    dk_video_.set_sharpness(sharpness_);
-    dk_video_.set_hud_enabled(debug_hud_);
-    bool ok = dk_video_.init();
-    log(ok ? "deko3d output started" : "deko3d output FAILED to start");
-    return ok;
-#else
-    return false;
-#endif
+void Engine::handle_rumble_event(const uint8_t* data, size_t size) {
+    // Xử lý kích hoạt mô-tơ rung của Joy-Con / Pro Controller qua libnx (nếu có)
 }
 
-void Engine::end_deko_output() {
-#ifdef __SWITCH__
-    dk_video_.shutdown();
-    log("deko3d output stopped");
-#endif
-}
-
-void Engine::send_gamepad(const xcloud::GamepadFrame& frame) {
-    if (!handshake_done_) return;
-    // Once the peer is gone every send fails inside libpeer and logs an error;
-    // at 125 Hz that filled the SD log with "sctp not connected" until the app
-    // was killed. Nothing to send input to anyway.
-    PeerConnectionState peer_state = peer_state_;
-    if (peer_state != PEER_CONNECTION_CONNECTED &&
-        peer_state != PEER_CONNECTION_COMPLETED)
-        return;
-    std::vector<uint8_t> packet;
-    {
-        std::lock_guard<std::mutex> lock(input_mutex_);
-        packet = input_.gamepad_packet(
-            frame, static_cast<double>(SDL_GetTicks64() - stream_epoch_));
-    }
-    send_binary_on_channel("input", packet);
-}
-
-void Engine::request_keyframe() {
-    std::lock_guard<std::mutex> lock(peer_mutex_);
-    request_keyframe_locked();
-}
-
-// Caller must hold peer_mutex_ (used from on_video, which runs under it).
-void Engine::request_keyframe_locked() {
-    if (!handshake_done_ || !peer_) return;
-    // Throttle: at most one request per second.
-    Uint64 now = SDL_GetTicks64();
-    if (now - last_keyframe_req_.load() < 1000) return;
-    last_keyframe_req_ = now;
-    pli_sent_++;
-    peer_connection_request_keyframe(peer_);  // RTCP PLI (the one xCloud honors)
-    send_on_channel_locked("control", xcloud::video_keyframe_requested());
-}
-
-}  // namespace gnx::stream
+// Bỏ qua tất cả các luồng nhận Frame Video và Audio
+void Engine::OnFrame(const webrtc::VideoFrame& frame) { return; }
+void Engine::OnAudioData(const void* audio_data, int bits_per_sample, int sample_rate, size_t number_of_channels, size_t number_of_frames) { return; }
